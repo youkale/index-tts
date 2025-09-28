@@ -83,6 +83,7 @@ def load_config():
         's3_bucket_name': os.getenv('S3_BUCKET_NAME'),
         's3_region': os.getenv('S3_REGION', 'us-east-1'),
         's3_endpoint_url': os.getenv('S3_ENDPOINT_URL'),  # For compatible S3 services
+        's3_public_url': os.getenv('S3_PUBLIC_URL'),  # Public access URL (different from API endpoint)
 
         # Directories
         'upload_audio_dir': './upload_audio',
@@ -172,8 +173,15 @@ def generate_s3_url(s3_key: str) -> str:
     """Generate the correct S3 URL based on the service provider"""
     bucket_name = config['s3_bucket_name']
     endpoint_url = config['s3_endpoint_url']
+    public_url = config['s3_public_url']
     region = config['s3_region']
 
+    # Priority 1: Use public URL if configured (for CDN/public access)
+    if public_url:
+        clean_public_url = public_url.rstrip('/')
+        return f"{clean_public_url}/{s3_key}"
+
+    # Priority 2: Use endpoint URL for direct access
     if endpoint_url:
         # For custom endpoints (R2, MinIO, etc.)
         # Clean up endpoint URL (remove trailing slash)
@@ -190,7 +198,7 @@ def generate_s3_url(s3_key: str) -> str:
             # Custom AWS S3 endpoint
             return f"{clean_endpoint}/{bucket_name}/{s3_key}"
     else:
-        # Standard AWS S3 URL format
+        # Priority 3: Standard AWS S3 URL format
         return f"https://{bucket_name}.s3.{region}.amazonaws.com/{s3_key}"
 
 def is_url(path: str) -> bool:

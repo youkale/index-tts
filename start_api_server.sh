@@ -54,7 +54,7 @@ echo "  Kafka Servers: ${KAFKA_BOOTSTRAP_SERVERS:-localhost:9092}"
 echo "  S3 Bucket: ${S3_BUCKET_NAME:-not configured}"
 
 # Start the API server
-python api_server.py \
+uv run api_server.py \
     --model_dir "$MODEL_DIR" \
     --host "$HOST" \
     --port "$PORT" \

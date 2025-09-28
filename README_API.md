@@ -86,7 +86,32 @@ S3_REGION=us-east-1
 ```bash
 # Cloudflare R2 Storage
 S3_ENDPOINT_URL=https://your-account-id.r2.cloudflarestorage.com
+S3_PUBLIC_URL=https://your-custom-domain.com  # Optional: Custom domain for public access
 S3_REGION=auto
+```
+
+**Cloudflare R2 Public Access Options:**
+- **Direct R2 URL**: Files accessible via R2's default domain
+- **Custom Domain**: Configure a custom domain in Cloudflare for branded URLs
+- **CDN Integration**: Use Cloudflare CDN for global distribution
+
+**URL Configuration Priority:**
+1. **S3_PUBLIC_URL** - Used for public file access (highest priority)
+2. **S3_ENDPOINT_URL** - Used for API operations and fallback access
+3. **Default AWS format** - Used when no custom endpoints are configured
+
+**Example Configurations:**
+
+**Cloudflare R2 with Custom Domain:**
+```bash
+S3_ENDPOINT_URL=https://abc123.r2.cloudflarestorage.com
+S3_PUBLIC_URL=https://cdn.yourdomain.com
+```
+
+**Cloudflare R2 without Custom Domain:**
+```bash
+S3_ENDPOINT_URL=https://abc123.r2.cloudflarestorage.com
+# S3_PUBLIC_URL=  # Leave empty to use endpoint URL
 ```
 
 ##### MinIO (for local testing)
@@ -100,6 +125,7 @@ docker run -d --name minio \
 
 # Configuration
 S3_ENDPOINT_URL=http://localhost:9000
+S3_PUBLIC_URL=http://localhost:9000/your-bucket-name  # Public access URL
 S3_ACCESS_KEY=minioadmin
 S3_SECRET_KEY=minioadmin
 ```
