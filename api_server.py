@@ -469,18 +469,36 @@ def kafka_tts_consumer_worker():
             group_id=config['kafka_tts_consumer_group'],
             value_deserializer=lambda x: json.loads(x.decode('utf-8')),
             auto_offset_reset='latest',
-            enable_auto_commit=True
+            enable_auto_commit=False,  # 禁用自动提交
+            max_poll_records=1  # 一次只处理一条消息，确保提交的准确性
         )
 
         logger.info("Kafka TTS consumer started, waiting for tasks...")
 
         for message in consumer:
+            task_uuid = "unknown"
             try:
                 task_data = message.value
-                logger.info(f"Received TTS task: {task_data.get('task_uuid', 'unknown')}")
+                task_uuid = task_data.get('task_uuid', 'unknown')
+                logger.info(f"Received TTS task: {task_uuid}")
+
+                # 处理任务
                 process_tts_task(task_data)
+
+                # 任务处理成功后手动提交offset
+                consumer.commit()
+                logger.info(f"Successfully processed and committed TTS task: {task_uuid}")
+
             except Exception as e:
-                logger.error(f"Error processing TTS task: {e}")
+                logger.error(f"Error processing TTS task {task_uuid}: {e}")
+
+                # 即使任务失败，也要提交offset以避免重复处理
+                # 这样可以防止同一个错误任务反复被处理
+                try:
+                    consumer.commit()
+                    logger.info(f"Committed offset for failed TTS task: {task_uuid}")
+                except Exception as commit_error:
+                    logger.error(f"Failed to commit offset for failed task {task_uuid}: {commit_error}")
 
     except Exception as e:
         logger.error(f"Kafka TTS consumer error: {e}")
@@ -496,18 +514,36 @@ def kafka_upload_consumer_worker():
             group_id=config['kafka_upload_consumer_group'],
             value_deserializer=lambda x: json.loads(x.decode('utf-8')),
             auto_offset_reset='latest',
-            enable_auto_commit=True
+            enable_auto_commit=False,  # 禁用自动提交
+            max_poll_records=1  # 一次只处理一条消息，确保提交的准确性
         )
 
         logger.info("Kafka upload consumer started, waiting for results...")
 
         for message in consumer:
+            task_uuid = "unknown"
             try:
                 result_data = message.value
-                logger.info(f"Received upload task: {result_data.get('task_uuid', 'unknown')}")
+                task_uuid = result_data.get('task_uuid', 'unknown')
+                logger.info(f"Received upload task: {task_uuid}")
+
+                # 处理上传任务
                 process_upload_task(result_data)
+
+                # 任务处理成功后手动提交offset
+                consumer.commit()
+                logger.info(f"Successfully processed and committed upload task: {task_uuid}")
+
             except Exception as e:
-                logger.error(f"Error processing upload task: {e}")
+                logger.error(f"Error processing upload task {task_uuid}: {e}")
+
+                # 即使任务失败，也要提交offset以避免重复处理
+                # 这样可以防止同一个错误任务反复被处理
+                try:
+                    consumer.commit()
+                    logger.info(f"Committed offset for failed upload task: {task_uuid}")
+                except Exception as commit_error:
+                    logger.error(f"Failed to commit offset for failed upload task {task_uuid}: {commit_error}")
 
     except Exception as e:
         logger.error(f"Kafka upload consumer error: {e}")
