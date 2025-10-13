@@ -123,8 +123,12 @@ def init_redis_client():
             'port': config['redis_port'],
             'db': config['redis_db'],
             'decode_responses': True,
-            'socket_connect_timeout': 5,
-            'socket_timeout': 5
+            'socket_connect_timeout': 10,  # 增加连接超时
+            'socket_timeout': 30,          # 增加读写超时
+            'socket_keepalive': True,      # 启用 keepalive
+            'socket_keepalive_options': {},
+            'retry_on_timeout': True,      # 超时时重试
+            'health_check_interval': 30    # 健康检查间隔
         }
 
         if config['redis_password']:
@@ -210,25 +214,56 @@ class RedisPriorityQueue:
 
     def dequeue(self, timeout: int = 0) -> Optional[Dict[str, Any]]:
         """Get highest priority task from queue"""
-        try:
-            if timeout > 0:
-                # Blocking pop with timeout
-                result = self.redis_client.bzpopmin(self.queue_name, timeout=timeout)
-                if result:
-                    queue_name, task_json, score = result
-                    return json.loads(task_json)
-            else:
-                # Non-blocking pop
-                result = self.redis_client.zpopmin(self.queue_name, count=1)
-                if result:
-                    task_json, score = result[0]
-                    return json.loads(task_json)
+        max_retries = 3
+        retry_count = 0
 
-            return None
+        while retry_count < max_retries:
+            try:
+                if timeout > 0:
+                    # Blocking pop with timeout
+                    result = self.redis_client.bzpopmin(self.queue_name, timeout=timeout)
+                    if result:
+                        queue_name, task_json, score = result
+                        return json.loads(task_json)
+                else:
+                    # Non-blocking pop
+                    result = self.redis_client.zpopmin(self.queue_name, count=1)
+                    if result:
+                        task_json, score = result[0]
+                        return json.loads(task_json)
 
-        except Exception as e:
-            logger.error(f"Failed to dequeue task: {e}")
-            return None
+                return None
+
+            except redis.TimeoutError as e:
+                retry_count += 1
+                logger.warning(f"Redis timeout (attempt {retry_count}/{max_retries}): {e}")
+                if retry_count < max_retries:
+                    time.sleep(1)  # 短暂等待后重试
+                    continue
+                else:
+                    logger.error(f"Redis timeout after {max_retries} attempts")
+                    return None
+
+            except redis.ConnectionError as e:
+                retry_count += 1
+                logger.warning(f"Redis connection error (attempt {retry_count}/{max_retries}): {e}")
+                if retry_count < max_retries:
+                    time.sleep(2)  # 等待更长时间后重试
+                    try:
+                        # 尝试重新连接
+                        self.redis_client.ping()
+                    except:
+                        pass
+                    continue
+                else:
+                    logger.error(f"Redis connection failed after {max_retries} attempts")
+                    return None
+
+            except Exception as e:
+                logger.error(f"Unexpected error in dequeue: {e}")
+                return None
+
+        return None
 
     def size(self) -> int:
         """Get queue size"""
@@ -558,6 +593,8 @@ def process_upload_task(result_data: Dict[str, Any]):
 def redis_tts_consumer_worker():
     """Redis consumer worker that processes TTS generation tasks"""
     logger.info("Starting Redis TTS consumer worker")
+    consecutive_errors = 0
+    max_consecutive_errors = 10
 
     while True:
         try:
@@ -565,28 +602,40 @@ def redis_tts_consumer_worker():
             task_data = tts_queue.dequeue(timeout=5)
 
             if task_data is None:
+                consecutive_errors = 0  # 重置错误计数
                 continue  # No task available, continue polling
 
             task_uuid = task_data.get('task_uuid', 'unknown')
-            priority = task_data.get('priority', 1)
+            priority = task_data.get('priority', 3)
             logger.info(f"Received TTS task: {task_uuid} with priority {priority}")
 
             try:
                 # 处理任务
                 process_tts_task(task_data)
                 logger.info(f"Successfully processed TTS task: {task_uuid}")
+                consecutive_errors = 0  # 重置错误计数
 
             except Exception as e:
                 logger.error(f"Error processing TTS task {task_uuid}: {e}")
                 # 任务已经从队列中移除，不需要额外处理
 
         except Exception as e:
-            logger.error(f"Redis TTS consumer error: {e}")
-            time.sleep(1)  # 短暂休眠后重试
+            consecutive_errors += 1
+            logger.error(f"Redis TTS consumer error ({consecutive_errors}/{max_consecutive_errors}): {e}")
+
+            if consecutive_errors >= max_consecutive_errors:
+                logger.critical(f"Too many consecutive errors ({consecutive_errors}), stopping worker")
+                break
+
+            # 根据错误次数调整休眠时间
+            sleep_time = min(consecutive_errors * 2, 30)  # 最多休眠30秒
+            time.sleep(sleep_time)
 
 def redis_upload_consumer_worker():
     """Redis consumer worker that processes upload tasks"""
     logger.info("Starting Redis upload consumer worker")
+    consecutive_errors = 0
+    max_consecutive_errors = 10
 
     while True:
         try:
@@ -594,33 +643,71 @@ def redis_upload_consumer_worker():
             result_data = upload_queue.dequeue(timeout=5)
 
             if result_data is None:
+                consecutive_errors = 0  # 重置错误计数
                 continue  # No task available, continue polling
 
             task_uuid = result_data.get('task_uuid', 'unknown')
-            priority = result_data.get('priority', 1)
+            priority = result_data.get('priority', 3)
             logger.info(f"Received upload task: {task_uuid} with priority {priority}")
 
             try:
                 # 处理上传任务
                 process_upload_task(result_data)
                 logger.info(f"Successfully processed upload task: {task_uuid}")
+                consecutive_errors = 0  # 重置错误计数
 
             except Exception as e:
                 logger.error(f"Error processing upload task {task_uuid}: {e}")
                 # 任务已经从队列中移除，不需要额外处理
 
         except Exception as e:
-            logger.error(f"Redis upload consumer error: {e}")
-            time.sleep(1)  # 短暂休眠后重试
+            consecutive_errors += 1
+            logger.error(f"Redis upload consumer error ({consecutive_errors}/{max_consecutive_errors}): {e}")
+
+            if consecutive_errors >= max_consecutive_errors:
+                logger.critical(f"Too many consecutive errors ({consecutive_errors}), stopping worker")
+                break
+
+            # 根据错误次数调整休眠时间
+            sleep_time = min(consecutive_errors * 2, 30)  # 最多休眠30秒
+            time.sleep(sleep_time)
 
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
-    return jsonify({
+    health_status = {
         'status': 'healthy',
         'timestamp': int(time.time()),
-        'model_version': getattr(tts_model, 'model_version', '1.0') if tts_model else None
-    })
+        'model_version': getattr(tts_model, 'model_version', '1.0') if tts_model else None,
+        'components': {}
+    }
+
+    # Check Redis connection
+    try:
+        if redis_client:
+            redis_client.ping()
+            health_status['components']['redis'] = {
+                'status': 'healthy',
+                'tts_queue_size': tts_queue.size() if tts_queue else 0,
+                'upload_queue_size': upload_queue.size() if upload_queue else 0
+            }
+        else:
+            health_status['components']['redis'] = {'status': 'not_initialized'}
+    except Exception as e:
+        health_status['status'] = 'degraded'
+        health_status['components']['redis'] = {
+            'status': 'unhealthy',
+            'error': str(e)
+        }
+
+    # Check TTS model
+    if tts_model:
+        health_status['components']['tts_model'] = {'status': 'loaded'}
+    else:
+        health_status['status'] = 'degraded'
+        health_status['components']['tts_model'] = {'status': 'not_loaded'}
+
+    return jsonify(health_status)
 
 @app.route('/generate', methods=['POST'])
 @requires_auth
