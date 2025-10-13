@@ -4,6 +4,8 @@ API Server for IndexTTS
 Independent API service based on gen_single method from webui.py
 """
 
+from __future__ import annotations
+
 import argparse
 import base64
 import json
