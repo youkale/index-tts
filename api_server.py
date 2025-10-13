@@ -19,10 +19,9 @@ from urllib.parse import urlparse
 import tempfile
 
 import boto3
+import redis
 import requests
 from flask import Flask, request, jsonify
-from kafka import KafkaProducer, KafkaConsumer
-from kafka.errors import KafkaError
 
 # Add project paths
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -39,9 +38,11 @@ app = Flask(__name__)
 
 # Global variables
 tts_model: Optional[IndexTTS2] = None
-kafka_producer: Optional[KafkaProducer] = None
+redis_client: Optional[redis.Redis] = None
 s3_client: Optional[Any] = None
 config: Dict[str, Any] = {}
+tts_queue: Optional[RedisPriorityQueue] = None
+upload_queue: Optional[RedisPriorityQueue] = None
 
 # Default parameters based on the provided JSON
 DEFAULT_PARAMS = {
@@ -70,12 +71,13 @@ def load_config():
         'api_username': os.getenv('API_USERNAME', 'admin'),
         'api_password': os.getenv('API_PASSWORD', 'admin123'),
 
-        # Kafka settings
-        'kafka_bootstrap_servers': os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092'),
-        'kafka_task_topic': os.getenv('KAFKA_TASK_TOPIC', 'tts_tasks'),
-        'kafka_result_topic': os.getenv('KAFKA_RESULT_TOPIC', 'tts_results'),
-        'kafka_tts_consumer_group': os.getenv('KAFKA_TTS_CONSUMER_GROUP', 'tts_workers'),
-        'kafka_upload_consumer_group': os.getenv('KAFKA_UPLOAD_CONSUMER_GROUP', 'upload_workers'),
+        # Redis settings
+        'redis_host': os.getenv('REDIS_HOST', 'localhost'),
+        'redis_port': int(os.getenv('REDIS_PORT', '6379')),
+        'redis_db': int(os.getenv('REDIS_DB', '0')),
+        'redis_password': os.getenv('REDIS_PASSWORD'),
+        'redis_tts_queue': os.getenv('REDIS_TTS_QUEUE', 'tts_tasks'),
+        'redis_upload_queue': os.getenv('REDIS_UPLOAD_QUEUE', 'tts_results'),
 
         # S3 settings
         's3_access_key': os.getenv('S3_ACCESS_KEY'),
@@ -110,18 +112,40 @@ def requires_auth(f):
         return f(*args, **kwargs)
     return decorated
 
-def init_kafka_producer():
-    """Initialize Kafka producer"""
-    global kafka_producer
+def init_redis_client():
+    """Initialize Redis client"""
+    global redis_client
     try:
-        kafka_producer = KafkaProducer(
-            bootstrap_servers=config['kafka_bootstrap_servers'].split(','),
-            value_serializer=lambda x: json.dumps(x).encode('utf-8'),
-            key_serializer=lambda x: x.encode('utf-8') if x else None
-        )
-        logger.info("Kafka producer initialized successfully")
+        redis_config = {
+            'host': config['redis_host'],
+            'port': config['redis_port'],
+            'db': config['redis_db'],
+            'decode_responses': True,
+            'socket_connect_timeout': 5,
+            'socket_timeout': 5
+        }
+
+        if config['redis_password']:
+            redis_config['password'] = config['redis_password']
+
+        redis_client = redis.Redis(**redis_config)
+
+        # Test connection
+        redis_client.ping()
+        logger.info("Redis client initialized successfully")
     except Exception as e:
-        logger.error(f"Failed to initialize Kafka producer: {e}")
+        logger.error(f"Failed to initialize Redis client: {e}")
+        raise
+
+def init_priority_queues():
+    """Initialize priority queues"""
+    global tts_queue, upload_queue
+    try:
+        tts_queue = RedisPriorityQueue(redis_client, config['redis_tts_queue'])
+        upload_queue = RedisPriorityQueue(redis_client, config['redis_upload_queue'])
+        logger.info("Priority queues initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize priority queues: {e}")
         raise
 
 def init_s3_client():
@@ -148,6 +172,77 @@ def init_directories():
     os.makedirs(config['upload_audio_dir'], exist_ok=True)
     os.makedirs(config['output_dir'], exist_ok=True)
     logger.info("Directories initialized")
+
+class RedisPriorityQueue:
+    """Redis-based priority queue using ZSet"""
+
+    def __init__(self, redis_client: redis.Redis, queue_name: str):
+        self.redis_client = redis_client
+        self.queue_name = queue_name
+
+    def calculate_score(self, priority: int = 3) -> float:
+        """Calculate score for priority queue: timestamp * (6 - priority)
+        Lower score = higher priority (processed first)
+        priority 1-5: 1=lowest, 5=highest priority
+        """
+        timestamp = time.time()
+        # Invert priority: priority 5 -> weight 1, priority 1 -> weight 5
+        priority_weight = 6 - priority
+        return timestamp * priority_weight
+
+    def enqueue(self, task_data: Dict[str, Any], priority: int = 3) -> bool:
+        """Add task to priority queue"""
+        try:
+            score = self.calculate_score(priority)
+            task_json = json.dumps(task_data)
+
+            # Use zadd to add task with score
+            result = self.redis_client.zadd(self.queue_name, {task_json: score})
+
+            logger.info(f"Enqueued task {task_data.get('task_uuid', 'unknown')} with priority {priority}, score {score}")
+            return result > 0
+
+        except Exception as e:
+            logger.error(f"Failed to enqueue task: {e}")
+            return False
+
+    def dequeue(self, timeout: int = 0) -> Optional[Dict[str, Any]]:
+        """Get highest priority task from queue"""
+        try:
+            if timeout > 0:
+                # Blocking pop with timeout
+                result = self.redis_client.bzpopmin(self.queue_name, timeout=timeout)
+                if result:
+                    queue_name, task_json, score = result
+                    return json.loads(task_json)
+            else:
+                # Non-blocking pop
+                result = self.redis_client.zpopmin(self.queue_name, count=1)
+                if result:
+                    task_json, score = result[0]
+                    return json.loads(task_json)
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Failed to dequeue task: {e}")
+            return None
+
+    def size(self) -> int:
+        """Get queue size"""
+        try:
+            return self.redis_client.zcard(self.queue_name)
+        except Exception as e:
+            logger.error(f"Failed to get queue size: {e}")
+            return 0
+
+    def clear(self) -> bool:
+        """Clear all tasks from queue"""
+        try:
+            return self.redis_client.delete(self.queue_name) > 0
+        except Exception as e:
+            logger.error(f"Failed to clear queue: {e}")
+            return False
 
 def upload_to_s3(local_file_path: str, task_uuid: str) -> str:
     """Upload file to S3 and return the S3 URL"""
@@ -359,18 +454,18 @@ def process_tts_task(task_data: Dict[str, Any]):
             'hook_url': hook_url,
             'local_file_path': output,
             'status': 'success',
-            'timestamp': int(time.time())
+            'timestamp': int(time.time()),
+            'priority': task_data.get('priority', 3)  # 保持相同优先级
         }
 
         try:
-            kafka_producer.send(
-                config['kafka_result_topic'],
-                key=task_uuid,
-                value=result_data
-            ).get(timeout=10)
-            logger.info(f"TTS result sent to upload queue for task {task_uuid}")
-        except KafkaError as e:
-            logger.error(f"Failed to send TTS result to Kafka: {e}")
+            success = upload_queue.enqueue(result_data, priority=result_data['priority'])
+            if success:
+                logger.info(f"TTS result sent to upload queue for task {task_uuid}")
+            else:
+                raise Exception("Failed to enqueue result")
+        except Exception as e:
+            logger.error(f"Failed to send TTS result to Redis: {e}")
             # Fallback: try to clean up the file
             try:
                 os.remove(output)
@@ -394,18 +489,18 @@ def process_tts_task(task_data: Dict[str, Any]):
             'hook_url': hook_url,
             'status': 'failed',
             'error_message': str(e),
-            'timestamp': int(time.time())
+            'timestamp': int(time.time()),
+            'priority': task_data.get('priority', 3)  # 保持相同优先级
         }
 
         try:
-            kafka_producer.send(
-                config['kafka_result_topic'],
-                key=task_uuid,
-                value=result_data
-            ).get(timeout=10)
-            logger.info(f"TTS failure result sent to upload queue for task {task_uuid}")
-        except KafkaError as e:
-            logger.error(f"Failed to send TTS failure result to Kafka: {e}")
+            success = upload_queue.enqueue(result_data, priority=result_data['priority'])
+            if success:
+                logger.info(f"TTS failure result sent to upload queue for task {task_uuid}")
+            else:
+                logger.error("Failed to enqueue failure result")
+        except Exception as queue_error:
+            logger.error(f"Failed to send TTS failure result to Redis: {queue_error}")
 
         # Clean up downloaded files in case of failure
         for file_path in downloaded_files:
@@ -458,95 +553,63 @@ def process_upload_task(result_data: Dict[str, Any]):
         send_webhook_callback(hook_url, task_uuid, status="failed", error_message=error_message)
         logger.info(f"Sent failure webhook for task {task_uuid}")
 
-def kafka_tts_consumer_worker():
-    """Kafka consumer worker that processes TTS generation tasks"""
-    logger.info("Starting Kafka TTS consumer worker")
+def redis_tts_consumer_worker():
+    """Redis consumer worker that processes TTS generation tasks"""
+    logger.info("Starting Redis TTS consumer worker")
 
-    try:
-        consumer = KafkaConsumer(
-            config['kafka_task_topic'],
-            bootstrap_servers=config['kafka_bootstrap_servers'].split(','),
-            group_id=config['kafka_tts_consumer_group'],
-            value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-            auto_offset_reset='latest',
-            enable_auto_commit=False,  # 禁用自动提交
-            max_poll_records=1  # 一次只处理一条消息，确保提交的准确性
-        )
+    while True:
+        try:
+            # Blocking dequeue with 5 second timeout
+            task_data = tts_queue.dequeue(timeout=5)
 
-        logger.info("Kafka TTS consumer started, waiting for tasks...")
+            if task_data is None:
+                continue  # No task available, continue polling
 
-        for message in consumer:
-            task_uuid = "unknown"
+            task_uuid = task_data.get('task_uuid', 'unknown')
+            priority = task_data.get('priority', 1)
+            logger.info(f"Received TTS task: {task_uuid} with priority {priority}")
+
             try:
-                task_data = message.value
-                task_uuid = task_data.get('task_uuid', 'unknown')
-                logger.info(f"Received TTS task: {task_uuid}")
-
                 # 处理任务
                 process_tts_task(task_data)
-
-                # 任务处理成功后手动提交offset
-                consumer.commit()
-                logger.info(f"Successfully processed and committed TTS task: {task_uuid}")
+                logger.info(f"Successfully processed TTS task: {task_uuid}")
 
             except Exception as e:
                 logger.error(f"Error processing TTS task {task_uuid}: {e}")
+                # 任务已经从队列中移除，不需要额外处理
 
-                # 即使任务失败，也要提交offset以避免重复处理
-                # 这样可以防止同一个错误任务反复被处理
-                try:
-                    consumer.commit()
-                    logger.info(f"Committed offset for failed TTS task: {task_uuid}")
-                except Exception as commit_error:
-                    logger.error(f"Failed to commit offset for failed task {task_uuid}: {commit_error}")
+        except Exception as e:
+            logger.error(f"Redis TTS consumer error: {e}")
+            time.sleep(1)  # 短暂休眠后重试
 
-    except Exception as e:
-        logger.error(f"Kafka TTS consumer error: {e}")
+def redis_upload_consumer_worker():
+    """Redis consumer worker that processes upload tasks"""
+    logger.info("Starting Redis upload consumer worker")
 
-def kafka_upload_consumer_worker():
-    """Kafka consumer worker that processes upload tasks"""
-    logger.info("Starting Kafka upload consumer worker")
+    while True:
+        try:
+            # Blocking dequeue with 5 second timeout
+            result_data = upload_queue.dequeue(timeout=5)
 
-    try:
-        consumer = KafkaConsumer(
-            config['kafka_result_topic'],
-            bootstrap_servers=config['kafka_bootstrap_servers'].split(','),
-            group_id=config['kafka_upload_consumer_group'],
-            value_deserializer=lambda x: json.loads(x.decode('utf-8')),
-            auto_offset_reset='latest',
-            enable_auto_commit=False,  # 禁用自动提交
-            max_poll_records=1  # 一次只处理一条消息，确保提交的准确性
-        )
+            if result_data is None:
+                continue  # No task available, continue polling
 
-        logger.info("Kafka upload consumer started, waiting for results...")
+            task_uuid = result_data.get('task_uuid', 'unknown')
+            priority = result_data.get('priority', 1)
+            logger.info(f"Received upload task: {task_uuid} with priority {priority}")
 
-        for message in consumer:
-            task_uuid = "unknown"
             try:
-                result_data = message.value
-                task_uuid = result_data.get('task_uuid', 'unknown')
-                logger.info(f"Received upload task: {task_uuid}")
-
                 # 处理上传任务
                 process_upload_task(result_data)
-
-                # 任务处理成功后手动提交offset
-                consumer.commit()
-                logger.info(f"Successfully processed and committed upload task: {task_uuid}")
+                logger.info(f"Successfully processed upload task: {task_uuid}")
 
             except Exception as e:
                 logger.error(f"Error processing upload task {task_uuid}: {e}")
+                # 任务已经从队列中移除，不需要额外处理
 
-                # 即使任务失败，也要提交offset以避免重复处理
-                # 这样可以防止同一个错误任务反复被处理
-                try:
-                    consumer.commit()
-                    logger.info(f"Committed offset for failed upload task: {task_uuid}")
-                except Exception as commit_error:
-                    logger.error(f"Failed to commit offset for failed upload task {task_uuid}: {commit_error}")
-
-    except Exception as e:
-        logger.error(f"Kafka upload consumer error: {e}")
+        except Exception as e:
+            logger.error(f"Redis upload consumer error: {e}")
+            time.sleep(1)  # 短暂休眠后重试
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -570,6 +633,11 @@ def generate_tts():
             if field not in data:
                 return jsonify({'error': f'Missing required field: {field}'}), 400
 
+        # Validate priority parameter
+        priority = data.get('priority', 3)  # Default to medium priority
+        if not isinstance(priority, int) or priority < 1 or priority > 5:
+            return jsonify({'error': 'Priority must be an integer between 1 and 5 (1=lowest, 5=highest)'}), 400
+
         # Generate task UUID
         task_uuid = str(uuid.uuid4())
 
@@ -580,19 +648,19 @@ def generate_tts():
             'text': data['text'],
             'hook_url': data['hook_url'],
             'params': data.get('params', {}),
+            'priority': priority,
             'timestamp': int(time.time())
         }
 
-        # Send to Kafka
+        # Send to Redis priority queue
         try:
-            kafka_producer.send(
-                config['kafka_task_topic'],
-                key=task_uuid,
-                value=task_data
-            ).get(timeout=10)
-            logger.info(f"Task {task_uuid} sent to Kafka")
-        except KafkaError as e:
-            logger.error(f"Failed to send task to Kafka: {e}")
+            success = tts_queue.enqueue(task_data, priority=priority)
+            if success:
+                logger.info(f"Task {task_uuid} sent to Redis with priority {priority}")
+            else:
+                raise Exception("Failed to enqueue task")
+        except Exception as e:
+            logger.error(f"Failed to send task to Redis: {e}")
             return jsonify({'error': 'Failed to queue task'}), 500
 
         return jsonify({
@@ -664,8 +732,11 @@ def main():
             use_cuda_kernel=args.cuda_kernel,
         )
 
-        logger.info("Initializing Kafka producer...")
-        init_kafka_producer()
+        logger.info("Initializing Redis client...")
+        init_redis_client()
+
+        logger.info("Initializing priority queues...")
+        init_priority_queues()
 
         logger.info("Initializing S3 client...")
         init_s3_client()
@@ -680,7 +751,7 @@ def main():
     # Start TTS worker threads
     for i in range(args.tts_workers):
         worker_thread = threading.Thread(
-            target=kafka_tts_consumer_worker,
+            target=redis_tts_consumer_worker,
             name=f"tts-worker-{i}",
             daemon=True
         )
@@ -690,7 +761,7 @@ def main():
     # Start upload worker threads
     for i in range(args.upload_workers):
         worker_thread = threading.Thread(
-            target=kafka_upload_consumer_worker,
+            target=redis_upload_consumer_worker,
             name=f"upload-worker-{i}",
             daemon=True
         )
@@ -699,7 +770,7 @@ def main():
 
     # Start Flask app
     logger.info(f"Starting API server on {args.host}:{args.port}")
-    logger.info(f"Architecture: Client → Flask API → Kafka Task Queue → TTS Workers → Kafka Result Queue → Upload Workers → S3 → Webhook")
+    logger.info(f"Architecture: Client → Flask API → Redis Priority Queue → TTS Workers → Redis Priority Queue → Upload Workers → S3 → Webhook")
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
 
 if __name__ == "__main__":
