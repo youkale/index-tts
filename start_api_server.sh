@@ -1,10 +1,18 @@
 #!/bin/bash
 
 # IndexTTS API Server Startup Script
+# Uses Redis for priority-based task queuing
 
 set -e
 
 echo "Starting IndexTTS API Server..."
+
+# Check if uv is available
+if ! command -v uv &> /dev/null; then
+    echo "Error: uv is not installed. Please install uv first:"
+    echo "  curl -LsSf https://astral.sh/uv/install.sh | sh"
+    exit 1
+fi
 
 # Check if .env file exists
 if [ ! -f .env ]; then
@@ -23,6 +31,8 @@ HOST=${HOST:-"127.0.0.1"}
 PORT=${PORT:-"7861"}
 TTS_WORKERS=${TTS_WORKERS:-"1"}
 UPLOAD_WORKERS=${UPLOAD_WORKERS:-"1"}
+REDIS_HOST=${REDIS_HOST:-"localhost"}
+REDIS_PORT=${REDIS_PORT:-"6379"}
 
 # Check if model directory exists
 if [ ! -d "$MODEL_DIR" ]; then
@@ -40,6 +50,20 @@ for file in "${REQUIRED_FILES[@]}"; do
     fi
 done
 
+# Check Redis connection
+echo "Checking Redis connection..."
+if command -v redis-cli &> /dev/null; then
+    if redis-cli -h "$REDIS_HOST" -p "$REDIS_PORT" ping &> /dev/null; then
+        echo "✓ Redis connection successful"
+    else
+        echo "Warning: Cannot connect to Redis at $REDIS_HOST:$REDIS_PORT"
+        echo "Make sure Redis is running and accessible"
+        echo "You can start Redis with: redis-server"
+    fi
+else
+    echo "Note: redis-cli not found, skipping Redis connection check"
+fi
+
 # Create necessary directories
 mkdir -p upload_audio
 mkdir -p outputs
@@ -50,7 +74,7 @@ echo "  Host: $HOST"
 echo "  Port: $PORT"
 echo "  TTS Workers: $TTS_WORKERS"
 echo "  Upload Workers: $UPLOAD_WORKERS"
-echo "  Kafka Servers: ${KAFKA_BOOTSTRAP_SERVERS:-localhost:9092}"
+echo "  Redis Host: $REDIS_HOST:$REDIS_PORT"
 echo "  S3 Bucket: ${S3_BUCKET_NAME:-not configured}"
 
 # Start the API server
