@@ -70,7 +70,7 @@ webui = [
 # To install the API server support, use `uv sync --extra api` (or `--all-extras`).
 api = [
   "flask==3.0.3",
-  "kafka-python==2.0.2",
+  "redis==5.0.1",
   "boto3==1.35.0",
   "requests==2.32.3",
 ]

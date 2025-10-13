@@ -1,11 +1,11 @@
 # IndexTTS API Server
 
-Independent API service for IndexTTS text-to-speech generation using Kafka message queuing and S3 storage.
+Independent API service for IndexTTS text-to-speech generation using Redis priority queuing and S3 storage.
 
 ## Features
 
 - **REST API**: Simple HTTP endpoints for TTS generation
-- **Async Processing**: Uses Kafka for task queuing and async processing
+- **Priority Processing**: Uses Redis ZSet for priority-based task queuing and async processing
 - **Cloud Storage**: Automatic upload to S3-compatible storage
 - **Webhook Callbacks**: Notify clients when tasks complete
 - **Basic Authentication**: Simple username/password authentication
@@ -36,12 +36,13 @@ Edit `.env` with your configuration:
 API_USERNAME=your_username
 API_PASSWORD=your_password
 
-# Kafka Configuration
-KAFKA_BOOTSTRAP_SERVERS=localhost:9092
-KAFKA_TASK_TOPIC=tts_tasks
-KAFKA_RESULT_TOPIC=tts_results
-KAFKA_TTS_CONSUMER_GROUP=tts_workers
-KAFKA_UPLOAD_CONSUMER_GROUP=upload_workers
+# Redis Configuration
+REDIS_HOST=localhost
+REDIS_PORT=6379
+REDIS_DB=0
+REDIS_PASSWORD=
+REDIS_TTS_QUEUE=tts_tasks
+REDIS_UPLOAD_QUEUE=tts_results
 
 # S3 Configuration
 S3_ACCESS_KEY=your_access_key
@@ -52,14 +53,19 @@ S3_REGION=us-east-1
 
 ### 3. Setup Infrastructure
 
-#### Kafka
+#### Redis
 ```bash
 # Using Docker
-docker run -d --name kafka \
-  -p 9092:9092 \
-  -e KAFKA_ZOOKEEPER_CONNECT=zookeeper:2181 \
-  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
-  confluentinc/cp-kafka:latest
+docker run -d --name redis \
+  -p 6379:6379 \
+  redis:7-alpine
+
+# Or install locally
+# Ubuntu/Debian
+sudo apt-get install redis-server
+
+# macOS
+brew install redis
 ```
 
 #### S3-Compatible Storage
@@ -165,6 +171,7 @@ Request body:
     "spk_audio_prompt": "https://example.com/speaker_voice.wav",
     "text": "Hello, this is a test of text-to-speech generation.",
     "hook_url": "https://your-app.com/webhook/tts-complete",
+    "priority": 4,
     "params": {
         "emo_control_method": 1,
         "emo_weight": 0.65,
@@ -213,6 +220,14 @@ When the task completes, a POST request will be sent to your `hook_url`:
 - `spk_audio_prompt`: URL or local path to speaker reference audio file
 - `text`: Text to synthesize
 - `hook_url`: Webhook URL for completion notifications
+
+### Optional Parameters
+- `priority`: Task priority level (1-5, default: 3)
+  - 1: Lowest priority
+  - 2: Low priority
+  - 3: Medium priority (default)
+  - 4: High priority
+  - 5: Highest priority
 
 ### Audio Input Support
 The API supports both local file paths and HTTP/HTTPS URLs for audio inputs:
@@ -275,16 +290,16 @@ python test_api.py
 ## Architecture
 
 ```
-Client → Flask API → Kafka Task Queue → TTS Workers → Kafka Result Queue → Upload Workers → S3 → Webhook
+Client → Flask API → Redis Priority Queue → TTS Workers → Redis Priority Queue → Upload Workers → S3 → Webhook
 ```
 
 1. **Client sends request** to `/generate` endpoint
 2. **API validates** request and generates task UUID
-3. **Task queued** in Kafka task topic
-4. **TTS worker consumes** task from Kafka
+3. **Task queued** in Redis priority queue with priority level
+4. **TTS worker consumes** highest priority task from Redis
 5. **TTS generation** using IndexTTS2 model
-6. **Result sent** to Kafka result topic
-7. **Upload worker consumes** result from Kafka
+6. **Result sent** to Redis priority queue with same priority
+7. **Upload worker consumes** highest priority result from Redis
 8. **Audio uploaded** to S3 storage
 9. **Webhook callback** sent to client
 10. **Cleanup** temporary files
@@ -301,6 +316,6 @@ This architecture separates TTS generation from S3 upload operations, preventing
 ## Monitoring
 
 - Use `/health` endpoint for service monitoring
-- Check Kafka consumer lag for processing health
+- Check Redis queue sizes for processing health
 - Monitor S3 upload success rates
 - Track webhook delivery success
