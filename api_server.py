@@ -281,25 +281,39 @@ class RedisPriorityQueue:
             logger.error(f"Failed to clear queue: {e}")
             return False
 
-def upload_to_s3(local_file_path: str, task_uuid: str) -> str:
-    """Upload file to S3 and return the S3 URL"""
-    try:
-        s3_key = f"{task_uuid}.wav"
-        s3_client.upload_file(
-            local_file_path,
-            config['s3_bucket_name'],
-            s3_key,
-            ExtraArgs={'ContentType': 'audio/wav'}
-        )
+def upload_to_s3(local_file_path: str, task_uuid: str, max_retries: int = 3) -> str:
+    """Upload file to S3 with retry logic"""
+    s3_key = f"{task_uuid}.wav"
 
-        # Generate the S3 URL based on service type
-        s3_url = generate_s3_url(s3_key)
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"[Task {task_uuid}] [S3] Upload attempt {attempt + 1}/{max_retries}")
 
-        logger.info(f"File uploaded to S3: {s3_url}")
-        return s3_url
-    except Exception as e:
-        logger.error(f"Failed to upload to S3: {e}")
-        raise
+            s3_client.upload_file(
+                local_file_path,
+                config['s3_bucket_name'],
+                s3_key,
+                ExtraArgs={'ContentType': 'audio/wav'}
+            )
+
+            # Generate the S3 URL based on service type
+            s3_url = generate_s3_url(s3_key)
+
+            logger.info(f"[Task {task_uuid}] [S3] Upload successful on attempt {attempt + 1}: {s3_url}")
+            return s3_url
+
+        except Exception as e:
+            logger.warning(f"[Task {task_uuid}] [S3] Upload attempt {attempt + 1}/{max_retries} failed: {e}")
+
+            if attempt < max_retries - 1:
+                # 指数退避重试
+                wait_time = 2 ** attempt  # 1秒, 2秒, 4秒
+                logger.info(f"[Task {task_uuid}] [S3] Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                # 所有重试都失败
+                logger.error(f"[Task {task_uuid}] [S3] All {max_retries} upload attempts failed")
+                raise
 
 def generate_s3_url(s3_key: str) -> str:
     """Generate the correct S3 URL based on the service provider"""
@@ -371,39 +385,83 @@ def download_audio_from_url(url: str, task_uuid: str) -> str:
         logger.error(f"Failed to download audio from URL {url}: {e}")
         raise Exception(f"Failed to download audio: {str(e)}")
 
-def send_webhook_callback(hook_url: str, task_uuid: str, s3_url: str = None, status: str = "success", error_message: str = None):
-    """Send webhook callback to the provided URL"""
+def send_webhook_callback(hook_url: str, task_uuid: str, s3_url: str = None, status: str = "success", error_message: str = None, max_retries: int = 3):
+    """Send webhook callback to the provided URL with retry logic"""
+
+    # Validate hook_url
     try:
-        payload = {
-            "task_uuid": task_uuid,
-            "status": status,
-            "timestamp": int(time.time())
-        }
-
-        if status == "success" and s3_url:
-            payload["s3_url"] = s3_url
-        elif status == "failed" and error_message:
-            payload["error_message"] = error_message
-
-        response = requests.post(
-            hook_url,
-            json=payload,
-            timeout=30,
-            headers={'Content-Type': 'application/json'}
-        )
-
-        if response.status_code == 200:
-            logger.info(f"Webhook callback sent successfully for task {task_uuid}")
-        else:
-            logger.warning(f"Webhook callback failed with status {response.status_code} for task {task_uuid}")
-
+        parsed = urlparse(hook_url)
+        if not all([parsed.scheme, parsed.netloc]) or parsed.scheme not in ['http', 'https']:
+            logger.error(f"[Task {task_uuid}] Invalid hook_url: {hook_url}")
+            return False
     except Exception as e:
-        logger.error(f"Failed to send webhook callback for task {task_uuid}: {e}")
+        logger.error(f"[Task {task_uuid}] Failed to parse hook_url: {e}")
+        return False
+
+    payload = {
+        "task_uuid": task_uuid,
+        "status": status,
+        "timestamp": int(time.time())
+    }
+
+    if status == "success" and s3_url:
+        payload["s3_url"] = s3_url
+    elif status == "failed" and error_message:
+        payload["error_message"] = error_message
+
+    logger.info(f"[Task {task_uuid}] [CALLBACK] Starting webhook callback to {hook_url}, status: {status}")
+
+    # Retry logic with exponential backoff
+    for attempt in range(max_retries):
+        try:
+            response = requests.post(
+                hook_url,
+                json=payload,
+                timeout=40,  # 40秒超时
+                headers={'Content-Type': 'application/json'}
+            )
+
+            # 检查所有2xx状态码
+            if 200 <= response.status_code < 300:
+                logger.info(f"[Task {task_uuid}] [CALLBACK] Webhook callback sent successfully (attempt {attempt + 1}/{max_retries}), status code: {response.status_code}")
+                return True
+            else:
+                logger.warning(f"[Task {task_uuid}] [CALLBACK] Webhook failed with status {response.status_code} (attempt {attempt + 1}/{max_retries}), response: {response.text[:200]}")
+
+        except requests.Timeout as e:
+            logger.warning(f"[Task {task_uuid}] [CALLBACK] Webhook timeout (attempt {attempt + 1}/{max_retries}): {e}")
+        except Exception as e:
+            logger.error(f"[Task {task_uuid}] [CALLBACK] Failed to send webhook (attempt {attempt + 1}/{max_retries}): {e}")
+
+        # 指数退避
+        if attempt < max_retries - 1:
+            wait_time = 2 ** attempt  # 1秒, 2秒, 4秒...
+            logger.info(f"[Task {task_uuid}] [CALLBACK] Retrying in {wait_time} seconds...")
+            time.sleep(wait_time)
+
+    # 所有重试失败
+    logger.error(f"[Task {task_uuid}] [CALLBACK] Webhook callback failed after {max_retries} attempts")
+
+    # 保存到Redis待重试队列
+    try:
+        failed_webhook_data = {
+            'hook_url': hook_url,
+            'payload': payload,
+            'task_uuid': task_uuid,
+            'timestamp': int(time.time())
+        }
+        redis_client.rpush('failed_webhooks', json.dumps(failed_webhook_data))
+        logger.info(f"[Task {task_uuid}] [CALLBACK] Saved failed webhook to Redis for later retry")
+    except Exception as e:
+        logger.error(f"[Task {task_uuid}] [CALLBACK] Failed to save failed webhook to Redis: {e}")
+
+    return False
 
 def process_tts_task(task_data: Dict[str, Any]):
     """Process a single TTS task"""
     task_uuid = task_data['task_uuid']
-    logger.info(f"Processing TTS generation for task {task_uuid}")
+    start_time = time.time()
+    logger.info(f"[Task {task_uuid}] [TTS] Starting TTS generation task")
 
     downloaded_files = []  # Track downloaded files for cleanup
 
@@ -413,6 +471,8 @@ def process_tts_task(task_data: Dict[str, Any]):
         text = task_data['text']
         hook_url = task_data['hook_url']
         params = task_data.get('params', {})
+
+        logger.info(f"[Task {task_uuid}] [TTS] Text length: {len(text)} characters, speaker audio: {spk_audio_prompt[:100]}...")
 
         # Handle URL download for speaker audio prompt
         if is_url(spk_audio_prompt):
@@ -467,7 +527,9 @@ def process_tts_task(task_data: Dict[str, Any]):
         }
 
         # Generate TTS
-        logger.info(f"Starting TTS generation for task {task_uuid}")
+        logger.info(f"[Task {task_uuid}] [TTS] Starting voice cloning and synthesis...")
+        tts_start_time = time.time()
+
         output = tts_model.infer(
             spk_audio_prompt=spk_audio_prompt,
             text=text,
@@ -483,7 +545,8 @@ def process_tts_task(task_data: Dict[str, Any]):
             **generation_kwargs
         )
 
-        logger.info(f"TTS generation completed for task {task_uuid}")
+        tts_duration = time.time() - tts_start_time
+        logger.info(f"[Task {task_uuid}] [TTS] Voice cloning completed in {tts_duration:.2f} seconds, output saved to: {output}")
 
         # Send result to upload queue instead of uploading directly
         result_data = {
@@ -498,11 +561,12 @@ def process_tts_task(task_data: Dict[str, Any]):
         try:
             success = upload_queue.enqueue(result_data, priority=result_data['priority'])
             if success:
-                logger.info(f"TTS result sent to upload queue for task {task_uuid}")
+                total_duration = time.time() - start_time
+                logger.info(f"[Task {task_uuid}] [TTS] TTS result sent to upload queue (total processing time: {total_duration:.2f}s)")
             else:
                 raise Exception("Failed to enqueue result")
         except Exception as e:
-            logger.error(f"Failed to send TTS result to Redis: {e}")
+            logger.error(f"[Task {task_uuid}] [TTS] Failed to send TTS result to Redis: {e}")
             # Fallback: try to clean up the file
             try:
                 os.remove(output)
@@ -513,12 +577,13 @@ def process_tts_task(task_data: Dict[str, Any]):
         for file_path in downloaded_files:
             try:
                 os.remove(file_path)
-                logger.info(f"Cleaned up downloaded file: {file_path}")
+                logger.info(f"[Task {task_uuid}] [TTS] Cleaned up downloaded file: {file_path}")
             except Exception as e:
-                logger.warning(f"Failed to clean up downloaded file {file_path}: {e}")
+                logger.warning(f"[Task {task_uuid}] [TTS] Failed to clean up downloaded file {file_path}: {e}")
 
     except Exception as e:
-        logger.error(f"TTS generation failed for task {task_uuid}: {e}")
+        total_duration = time.time() - start_time
+        logger.error(f"[Task {task_uuid}] [TTS] TTS generation failed after {total_duration:.2f}s: {e}")
 
         # Send failure result to upload queue
         result_data = {
@@ -533,19 +598,19 @@ def process_tts_task(task_data: Dict[str, Any]):
         try:
             success = upload_queue.enqueue(result_data, priority=result_data['priority'])
             if success:
-                logger.info(f"TTS failure result sent to upload queue for task {task_uuid}")
+                logger.info(f"[Task {task_uuid}] [TTS] TTS failure result sent to upload queue")
             else:
-                logger.error("Failed to enqueue failure result")
+                logger.error(f"[Task {task_uuid}] [TTS] Failed to enqueue failure result")
         except Exception as queue_error:
-            logger.error(f"Failed to send TTS failure result to Redis: {queue_error}")
+            logger.error(f"[Task {task_uuid}] [TTS] Failed to send TTS failure result to Redis: {queue_error}")
 
         # Clean up downloaded files in case of failure
         for file_path in downloaded_files:
             try:
                 os.remove(file_path)
-                logger.info(f"Cleaned up downloaded file after failure: {file_path}")
+                logger.info(f"[Task {task_uuid}] [TTS] Cleaned up downloaded file after failure: {file_path}")
             except Exception as cleanup_error:
-                logger.warning(f"Failed to clean up downloaded file {file_path}: {cleanup_error}")
+                logger.warning(f"[Task {task_uuid}] [TTS] Failed to clean up downloaded file {file_path}: {cleanup_error}")
 
 def process_upload_task(result_data: Dict[str, Any]):
     """Process a completed TTS task - upload to S3 and send webhook"""
@@ -553,42 +618,55 @@ def process_upload_task(result_data: Dict[str, Any]):
     hook_url = result_data['hook_url']
     status = result_data['status']
 
-    logger.info(f"Processing upload for task {task_uuid} with status {status}")
+    logger.info(f"[Task {task_uuid}] [UPLOAD] Processing upload task with status: {status}")
 
     if status == 'success':
         local_file_path = result_data['local_file_path']
+        s3_url = None
+
         try:
             # Upload to S3
-            logger.info(f"Uploading to S3 for task {task_uuid}")
+            logger.info(f"[Task {task_uuid}] [S3] Starting upload to S3, file: {local_file_path}")
+            upload_start_time = time.time()
+
             s3_url = upload_to_s3(local_file_path, task_uuid)
 
-            # Send success webhook
-            send_webhook_callback(hook_url, task_uuid, s3_url=s3_url, status="success")
-
-            # Clean up local file
-            try:
-                os.remove(local_file_path)
-                logger.info(f"Cleaned up local file for task {task_uuid}")
-            except Exception as e:
-                logger.warning(f"Failed to clean up local file for task {task_uuid}: {e}")
-
-            logger.info(f"Task {task_uuid} completed successfully")
+            upload_duration = time.time() - upload_start_time
+            logger.info(f"[Task {task_uuid}] [S3] Upload completed in {upload_duration:.2f}s, S3 URL: {s3_url}")
 
         except Exception as e:
-            logger.error(f"Upload failed for task {task_uuid}: {e}")
-            # Send failure webhook
+            logger.error(f"[Task {task_uuid}] [S3] Upload failed: {e}")
+            # S3上传失败，发送失败webhook
             send_webhook_callback(hook_url, task_uuid, status="failed", error_message=f"Upload failed: {str(e)}")
 
-            # Clean up local file on failure too
+            # Clean up local file on failure
             try:
                 os.remove(local_file_path)
             except:
                 pass
+            return  # 直接返回，不继续处理
+
+        # S3上传成功后，发送webhook回调
+        # 注意：即使webhook失败，S3文件已经上传成功
+        webhook_success = send_webhook_callback(hook_url, task_uuid, s3_url=s3_url, status="success")
+
+        if not webhook_success:
+            logger.warning(f"[Task {task_uuid}] [UPLOAD] Webhook callback failed but S3 upload succeeded. S3 URL: {s3_url}")
+            # Webhook失败已经保存到failed_webhooks队列，可以后续重试
+
+        # Clean up local file (无论webhook是否成功，S3已有副本)
+        try:
+            os.remove(local_file_path)
+            logger.info(f"[Task {task_uuid}] [UPLOAD] Cleaned up local file: {local_file_path}")
+        except Exception as e:
+            logger.warning(f"[Task {task_uuid}] [UPLOAD] Failed to clean up local file: {e}")
+
+        logger.info(f"[Task {task_uuid}] [UPLOAD] Task completed successfully")
     else:
         # Handle failed TTS task
         error_message = result_data.get('error_message', 'Unknown error')
+        logger.info(f"[Task {task_uuid}] [UPLOAD] Handling failed TTS task, error: {error_message}")
         send_webhook_callback(hook_url, task_uuid, status="failed", error_message=error_message)
-        logger.info(f"Sent failure webhook for task {task_uuid}")
 
 def redis_tts_consumer_worker():
     """Redis consumer worker that processes TTS generation tasks"""
@@ -716,19 +794,28 @@ def generate_tts():
     try:
         data = request.json
 
+        # Generate task UUID first for logging
+        task_uuid = str(uuid.uuid4())
+
+        logger.info(f"[Task {task_uuid}] [API] Received TTS generation request from {request.remote_addr}")
+
         # Validate required parameters
         required_fields = ['spk_audio_prompt', 'text', 'hook_url']
         for field in required_fields:
             if field not in data:
+                logger.warning(f"[Task {task_uuid}] [API] Missing required field: {field}")
                 return jsonify({'error': f'Missing required field: {field}'}), 400
 
         # Validate priority parameter
         priority = data.get('priority', 3)  # Default to medium priority
         if not isinstance(priority, int) or priority < 1 or priority > 5:
+            logger.warning(f"[Task {task_uuid}] [API] Invalid priority value: {priority}")
             return jsonify({'error': 'Priority must be an integer between 1 and 5 (1=lowest, 5=highest)'}), 400
 
-        # Generate task UUID
-        task_uuid = str(uuid.uuid4())
+        # Log request details
+        text_preview = data['text'][:100] + "..." if len(data['text']) > 100 else data['text']
+        logger.info(f"[Task {task_uuid}] [API] Request details - priority: {priority}, text_length: {len(data['text'])}, text_preview: {text_preview}")
+        logger.info(f"[Task {task_uuid}] [API] Speaker audio: {data['spk_audio_prompt'][:100]}..., hook_url: {data['hook_url']}")
 
         # Prepare task data
         task_data = {
@@ -745,11 +832,11 @@ def generate_tts():
         try:
             success = tts_queue.enqueue(task_data, priority=priority)
             if success:
-                logger.info(f"Task {task_uuid} sent to Redis with priority {priority}")
+                logger.info(f"[Task {task_uuid}] [API] Task queued successfully with priority {priority}, queue size: {tts_queue.size()}")
             else:
                 raise Exception("Failed to enqueue task")
         except Exception as e:
-            logger.error(f"Failed to send task to Redis: {e}")
+            logger.error(f"[Task {task_uuid}] [API] Failed to send task to Redis: {e}")
             return jsonify({'error': 'Failed to queue task'}), 500
 
         return jsonify({
@@ -759,7 +846,7 @@ def generate_tts():
         })
 
     except Exception as e:
-        logger.error(f"Error in generate_tts: {e}")
+        logger.error(f"[API] Error in generate_tts: {e}")
         return jsonify({'error': 'Internal server error'}), 500
 
 @app.errorhandler(404)

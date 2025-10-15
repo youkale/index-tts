@@ -5,6 +5,27 @@
 
 set -e
 
+# Parse command line arguments
+DAEMON_MODE=false
+LOG_FILE="./api_server.log"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -d|--daemon)
+            DAEMON_MODE=true
+            shift
+            ;;
+        --log-file)
+            LOG_FILE="$2"
+            shift 2
+            ;;
+        *)
+            # Pass through other arguments to the Python script
+            break
+            ;;
+    esac
+done
+
 echo "Starting IndexTTS API Server..."
 
 # Check if uv is available
@@ -76,12 +97,34 @@ echo "  TTS Workers: $TTS_WORKERS"
 echo "  Upload Workers: $UPLOAD_WORKERS"
 echo "  Redis Host: $REDIS_HOST:$REDIS_PORT"
 echo "  S3 Bucket: ${S3_BUCKET_NAME:-not configured}"
+echo "  Daemon Mode: $DAEMON_MODE"
+if [ "$DAEMON_MODE" = true ]; then
+    echo "  Log File: $LOG_FILE"
+fi
 
 # Start the API server
-uv run api_server.py \
-    --model_dir "$MODEL_DIR" \
-    --host "$HOST" \
-    --port "$PORT" \
-    --tts-workers "$TTS_WORKERS" \
-    --upload-workers "$UPLOAD_WORKERS" \
-    "$@"
+if [ "$DAEMON_MODE" = true ]; then
+    echo "Starting API server in daemon mode..."
+    nohup uv run api_server.py \
+        --model_dir "$MODEL_DIR" \
+        --host "$HOST" \
+        --port "$PORT" \
+        --tts-workers "$TTS_WORKERS" \
+        --upload-workers "$UPLOAD_WORKERS" \
+        "$@" > "$LOG_FILE" 2>&1 &
+
+    PID=$!
+    echo "$PID" > api_server.pid
+    echo "API server started with PID: $PID"
+    echo "Log file: $LOG_FILE"
+    echo "To stop the server, run: kill \$(cat api_server.pid)"
+    echo "To view logs, run: tail -f $LOG_FILE"
+else
+    uv run api_server.py \
+        --model_dir "$MODEL_DIR" \
+        --host "$HOST" \
+        --port "$PORT" \
+        --tts-workers "$TTS_WORKERS" \
+        --upload-workers "$UPLOAD_WORKERS" \
+        "$@"
+fi
