@@ -7,7 +7,8 @@ set -e
 
 # Parse command line arguments
 DAEMON_MODE=false
-LOG_FILE="./api_server.log"
+LOG_DIR="./logs"
+LOG_FILE="./api_server_console.log"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -17,6 +18,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --log-file)
             LOG_FILE="$2"
+            shift 2
+            ;;
+        --log-dir)
+            LOG_DIR="$2"
             shift 2
             ;;
         *)
@@ -88,6 +93,7 @@ fi
 # Create necessary directories
 mkdir -p upload_audio
 mkdir -p outputs
+mkdir -p "$LOG_DIR"
 
 echo "Configuration:"
 echo "  Model Directory: $MODEL_DIR"
@@ -97,9 +103,10 @@ echo "  TTS Workers: $TTS_WORKERS"
 echo "  Upload Workers: $UPLOAD_WORKERS"
 echo "  Redis Host: $REDIS_HOST:$REDIS_PORT"
 echo "  S3 Bucket: ${S3_BUCKET_NAME:-not configured}"
+echo "  Log Directory: $LOG_DIR"
 echo "  Daemon Mode: $DAEMON_MODE"
 if [ "$DAEMON_MODE" = true ]; then
-    echo "  Log File: $LOG_FILE"
+    echo "  Console Log File: $LOG_FILE"
 fi
 
 # Start the API server
@@ -109,6 +116,7 @@ if [ "$DAEMON_MODE" = true ]; then
         --model_dir "$MODEL_DIR" \
         --host "$HOST" \
         --port "$PORT" \
+        --log-dir "$LOG_DIR" \
         --tts-workers "$TTS_WORKERS" \
         --upload-workers "$UPLOAD_WORKERS" \
         "$@" > "$LOG_FILE" 2>&1 &
@@ -116,14 +124,21 @@ if [ "$DAEMON_MODE" = true ]; then
     PID=$!
     echo "$PID" > api_server.pid
     echo "API server started with PID: $PID"
-    echo "Log file: $LOG_FILE"
-    echo "To stop the server, run: kill \$(cat api_server.pid)"
-    echo "To view logs, run: tail -f $LOG_FILE"
+    echo ""
+    echo "Log files:"
+    echo "  Application logs: $LOG_DIR/api_server.log (rotates daily)"
+    echo "  Size-based logs: $LOG_DIR/api_server_size.log (rotates at 100MB)"
+    echo "  Console output: $LOG_FILE"
+    echo ""
+    echo "To stop the server, run: ./stop_api_server.sh"
+    echo "To view application logs: tail -f $LOG_DIR/api_server.log"
+    echo "To view console output: tail -f $LOG_FILE"
 else
     uv run api_server.py \
         --model_dir "$MODEL_DIR" \
         --host "$HOST" \
         --port "$PORT" \
+        --log-dir "$LOG_DIR" \
         --tts-workers "$TTS_WORKERS" \
         --upload-workers "$UPLOAD_WORKERS" \
         "$@"

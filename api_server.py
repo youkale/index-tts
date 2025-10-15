@@ -10,11 +10,13 @@ import argparse
 import base64
 import json
 import logging
+import logging.handlers
 import os
 import sys
 import threading
 import time
 import uuid
+from datetime import datetime
 from functools import wraps
 from typing import Dict, Any, Optional
 from urllib.parse import urlparse
@@ -32,8 +34,65 @@ sys.path.append(os.path.join(current_dir, "indextts"))
 
 from indextts.infer_v2 import IndexTTS2
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+def setup_logging(log_dir: str = './logs', log_level: int = logging.INFO):
+    """Setup logging with daily rotation and size limit"""
+
+    # Create logs directory if not exists
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Log file path with date
+    log_file = os.path.join(log_dir, 'api_server.log')
+
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # Root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+
+    # Remove existing handlers
+    root_logger.handlers.clear()
+
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+
+    # Timed rotating file handler (daily rotation)
+    # When='midnight': rotate at midnight
+    # interval=1: rotate every 1 day
+    # backupCount=30: keep 30 days of logs
+    timed_handler = logging.handlers.TimedRotatingFileHandler(
+        log_file,
+        when='midnight',
+        interval=1,
+        backupCount=30,
+        encoding='utf-8'
+    )
+    timed_handler.setLevel(log_level)
+    timed_handler.setFormatter(formatter)
+    timed_handler.suffix = '%Y-%m-%d'  # Add date suffix to rotated files
+    root_logger.addHandler(timed_handler)
+
+    # Size-based rotating file handler as backup (max 100MB per file, keep 10 files)
+    # This ensures that even within a day, if log grows too large, it rotates
+    size_handler = logging.handlers.RotatingFileHandler(
+        os.path.join(log_dir, 'api_server_size.log'),
+        maxBytes=100 * 1024 * 1024,  # 100MB
+        backupCount=10,
+        encoding='utf-8'
+    )
+    size_handler.setLevel(log_level)
+    size_handler.setFormatter(formatter)
+    root_logger.addHandler(size_handler)
+
+    return root_logger
+
+# Initialize logger (will be properly configured in main())
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -867,12 +926,23 @@ def main():
     parser.add_argument("--host", type=str, default="127.0.0.1", help="Host to run the API server on")
     parser.add_argument("--port", type=int, default=7861, help="Port to run the API server on")
     parser.add_argument("--model_dir", type=str, default="./checkpoints", help="Model checkpoints directory")
+    parser.add_argument("--log-dir", type=str, default="./logs", help="Directory for log files")
+    parser.add_argument("--log-level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level")
     parser.add_argument("--fp16", action="store_true", default=False, help="Use FP16 for inference if available")
     parser.add_argument("--deepspeed", action="store_true", default=False, help="Use DeepSpeed to accelerate if available")
     parser.add_argument("--cuda_kernel", action="store_true", default=False, help="Use CUDA kernel for inference if available")
     parser.add_argument("--tts-workers", type=int, default=1, help="Number of TTS generation workers")
     parser.add_argument("--upload-workers", type=int, default=1, help="Number of upload workers")
     args = parser.parse_args()
+
+    # Setup logging first
+    log_level = getattr(logging, args.log_level.upper())
+    setup_logging(log_dir=args.log_dir, log_level=log_level)
+    logger.info("=" * 80)
+    logger.info("Starting IndexTTS API Server")
+    logger.info("=" * 80)
+    logger.info(f"Log directory: {args.log_dir}")
+    logger.info(f"Log level: {args.log_level}")
 
     # Load configuration
     load_config()

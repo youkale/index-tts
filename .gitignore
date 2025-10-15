@@ -29,3 +29,8 @@ desktop.ini
 /checkpoints/*
 !/checkpoints/*.yaml
 /outputs/
+
+# Log files
+logs/
+*.log
+api_server.pid
